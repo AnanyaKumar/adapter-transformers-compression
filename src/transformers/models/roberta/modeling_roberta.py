@@ -414,6 +414,10 @@ class RobertaLayer(nn.Module):
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = RobertaAttention(config, position_embedding_type="absolute", location_key="cross")
         self.intermediate = RobertaIntermediate(config)
+        # We use a class for mask (even though it's a simple operation), so that
+        # the architecture prints out nicely when we print the model. If we just
+        # had a tensor then it wouldn't show up when we print(model).
+        self.mask = MLPMask(n=config.intermediate_size)
         self.output = RobertaOutput(config)
 
     def forward(
@@ -482,8 +486,21 @@ class RobertaLayer(nn.Module):
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
+        masked_output = self.mask(intermediate_output)
+        layer_output = self.output(masked_output, attention_output)
         return layer_output
+
+
+class MLPMask(nn.Module):
+    def __init__(self, n, dtype=torch.float32):
+        super().__init__()
+        device = 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda'
+        self._mask = nn.Parameter(torch.ones((n,), dtype=dtype, device=device))
+
+    def forward(self, x):
+        return self._mask * x
 
 
 # Copied from transformers.models.bert.modeling_bert.BertEncoder with Bert->Roberta
