@@ -24,6 +24,8 @@ from packaging import version
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+import numpy as np
+
 from ...activations import ACT2FN, gelu
 from ...adapters.composition import adjust_tensors_for_parallel
 from ...adapters.context import ForwardContext
@@ -418,11 +420,51 @@ class RobertaLayer(nn.Module):
         # the architecture prints out nicely when we print the model. If we just
         # had a tensor then it wouldn't show up when we print(model).
         self.mask = MLPMask(num_features=config.intermediate_size, active=False)
+        # This is used if we want to clip out certain values in the mask (e.g., the bottom k values).
+        self.clip_mask = None
         self.intermediate_size = config.intermediate_size
         self.output = RobertaOutput(config)
 
     def add_mlp_mask(self):
         self.mask.activate()
+
+    def get_k_remove(self, frac):
+        k_remove = int(len(self.mask) * frac)
+        k_remove = np.clip(k_remove, 0, len(self.mask) - 1)
+        return k_remove
+
+    def get_bottom_mask_indices(self, frac):
+        k_remove = self.get_k_remove(frac)
+        mask_np = np.abs(self.mask.detach().cpu().numpy())
+        bottom_k = np.argsort(mask_np)[:k_remove]
+        return bottom_k
+
+    def get_prune_indices(self, frac, strat='smallest'):
+        if strat == 'smallest':
+            prune_indices = self.get_bottom_mask_indices(frac)
+        elif strat == 'random':
+            k_remove = self.get_k_remove(frac)
+            prune_indices = np.random.permutation(len(self.mask))[:k_remove]
+        return prune_indices
+    
+    def clip_mask(self, frac, strat='smallest'):
+        # We use a clip_mask so that we can "undo" a clipping operation.
+        # The alternative is to directly set values to 0. But this is destructive---it would
+        # be hard for the user to try a different clipping strategy.
+        if frac == 0.0:
+            # Undo the clip mask, so don't clip any of the mask values any longer.
+            self.clip_mask = None
+        else:
+            clip_indices = self.get_prune_indices(frac, strat)
+            # Descructive alternative: self.mask.data[clip_indices] = 0.0
+            device = get_default_device()
+            self.clip_mask = torch.ones(len(self.mask), dtype=torch.float32, device=device)
+            self.clip_mask[clip_indices] = 0.0
+
+    def prune_mask(self, frac, strat='smallest'):
+        prune_indices = self.get_prune_indices(frac, strat)
+        # Prune the weights
+        raise NotImplementedError
 
     def forward(
         self,
@@ -492,16 +534,23 @@ class RobertaLayer(nn.Module):
         intermediate_output = self.intermediate(attention_output)
         if self.mask is not None:
             intermediate_output = self.mask(intermediate_output)
+        if self.clip_mask is not None:
+            intermediate_output = intermediate_output * self.clip_mask
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
+
+
+def get_default_device():
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    return device
 
 
 class MLPMask(nn.Module):
     def __init__(self, num_features, active=True, dtype=torch.float32):
         super(MLPMask, self).__init__()
-        device = 'cpu'
-        if torch.cuda.is_available():
-            device = 'cuda'
+        device = get_default_device()
         self.active = active
         self.num_features = num_features
         self.mask = nn.Parameter(torch.ones((num_features,), dtype=dtype, device=device))
@@ -530,6 +579,15 @@ class RobertaEncoder(nn.Module):
     def add_mlp_masks(self):
         for i, layer_module in enumerate(self.layer):
             layer_module.add_mlp_mask()
+
+    
+    def clip_mask(self, frac, strat='smallest'):
+        for i, layer_module in enumerate(self.layer):
+            layer_module.clip_mask(frac, strat=strat)
+
+    def prune_mask(self, frac, strat='smallest'):
+        for i, layer_module in enumerate(self.layer):
+            layer_module.prune_mask(frac, strat=strat)
 
     def forward(
         self,
@@ -652,6 +710,12 @@ class RobertaPreTrainedModel(PreTrainedModel):
     # Add a mask to the hidden layer of the MLP in the transformer.
     def add_mlp_masks(self):
         self.roberta.add_mlp_masks()
+
+    def clip_mask(self, frac, strat='smallest'):
+        self.roberta.clip_mask(frac, strat=strat)
+
+    def prune_mask(self, frac, strat='smallest'):
+        self.roberta.prune_mask(frac, strat=strat)
 
     # Copied from transformers.models.bert.modeling_bert.BertPreTrainedModel._init_weights
     def _init_weights(self, module):
@@ -789,6 +853,12 @@ class RobertaModel(BertModelAdaptersMixin, RobertaPreTrainedModel):
 
     def add_mlp_masks(self):
         self.encoder.add_mlp_masks()
+        
+    def clip_mask(self, frac, strat='smallest'):
+        self.encoder.clip_mask(frac, strat=strat)
+
+    def prune_mask(self, frac, strat='smallest'):
+        self.encoder.prune_mask(frac, strat=strat)
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
