@@ -417,8 +417,12 @@ class RobertaLayer(nn.Module):
         # We use a class for mask (even though it's a simple operation), so that
         # the architecture prints out nicely when we print the model. If we just
         # had a tensor then it wouldn't show up when we print(model).
-        self.mask = MLPMask(n=config.intermediate_size)
+        self.mask = MLPMask(num_features=config.intermediate_size, active=False)
+        self.intermediate_size = config.intermediate_size
         self.output = RobertaOutput(config)
+
+    def add_mlp_mask(self):
+        self.mask.activate()
 
     def forward(
         self,
@@ -486,21 +490,33 @@ class RobertaLayer(nn.Module):
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
-        masked_output = self.mask(intermediate_output)
-        layer_output = self.output(masked_output, attention_output)
+        if self.mask is not None:
+            intermediate_output = self.mask(intermediate_output)
+        layer_output = self.output(intermediate_output, attention_output)
         return layer_output
 
 
 class MLPMask(nn.Module):
-    def __init__(self, n, dtype=torch.float32):
-        super().__init__()
+    def __init__(self, num_features, active=True, dtype=torch.float32):
+        super(MLPMask, self).__init__()
         device = 'cpu'
         if torch.cuda.is_available():
             device = 'cuda'
-        self._mask = nn.Parameter(torch.ones((n,), dtype=dtype, device=device))
+        self.active = active
+        self.num_features = num_features
+        self.mask = nn.Parameter(torch.ones((num_features,), dtype=dtype, device=device))
 
     def forward(self, x):
-        return self._mask * x
+        if self.active:
+            return self.mask * x
+        else:
+            return x
+
+    def activate(self):
+        self.active = True
+
+    def extra_repr(self):
+        return 'active={}, num_features={}'.format(self.active, self.num_features)
 
 
 # Copied from transformers.models.bert.modeling_bert.BertEncoder with Bert->Roberta
@@ -510,6 +526,10 @@ class RobertaEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+
+    def add_mlp_masks(self):
+        for i, layer_module in enumerate(self.layer):
+            layer_module.add_mlp_mask()
 
     def forward(
         self,
@@ -628,6 +648,10 @@ class RobertaPreTrainedModel(PreTrainedModel):
     config_class = RobertaConfig
     base_model_prefix = "roberta"
     supports_gradient_checkpointing = True
+
+    # Add a mask to the hidden layer of the MLP in the transformer.
+    def add_mlp_masks(self):
+        self.roberta.add_mlp_masks()
 
     # Copied from transformers.models.bert.modeling_bert.BertPreTrainedModel._init_weights
     def _init_weights(self, module):
@@ -762,6 +786,9 @@ class RobertaModel(BertModelAdaptersMixin, RobertaPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def add_mlp_masks(self):
+        self.encoder.add_mlp_masks()
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
