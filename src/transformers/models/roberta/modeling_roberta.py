@@ -447,19 +447,23 @@ class RobertaLayer(nn.Module):
             prune_indices = np.random.permutation(self.mask.num_features)[:k_remove]
         return prune_indices
 
-    def clip_mask(self, frac, strat='smallest'):
+    def clip_mask(self, frac, strat='smallest', reversible=True):
         # We use a clip_mask so that we can "undo" a clipping operation.
         # The alternative is to directly set values to 0. But this is destructive---it would
         # be hard for the user to try a different clipping strategy.
+        # If reversible is False then we just set the smallest entries of mask to 0.
         if frac == 0.0:
             # Undo the clip mask, so don't clip any of the mask values any longer.
             self.mask_clipping = None
         else:
             clip_indices = self.get_prune_indices(frac, strat)
-            # Descructive alternative: self.mask.data[clip_indices] = 0.0
-            device = get_default_device()
-            self.mask_clipping = torch.ones(self.mask.num_features, dtype=torch.float32, device=device)
-            self.mask_clipping[clip_indices] = 0.0
+            if reversible:
+                device = get_default_device()
+                self.mask_clipping = torch.ones(self.mask.num_features, dtype=torch.float32, device=device)
+                self.mask_clipping[clip_indices] = 0.0
+            else:
+                self.mask.data[clip_indices] = 0.0
+                self.mask_clipping = None
 
     def prune_mask(self, frac, strat='smallest'):
         prune_indices = self.get_prune_indices(frac, strat)
@@ -581,9 +585,9 @@ class RobertaEncoder(nn.Module):
             layer_module.add_mlp_mask()
 
 
-    def clip_mask(self, frac, strat='smallest'):
+    def clip_mask(self, frac, strat='smallest', reversible=True):
         for i, layer_module in enumerate(self.layer):
-            layer_module.clip_mask(frac, strat=strat)
+            layer_module.clip_mask(frac, strat=strat, reversible=reversible)
 
     def prune_mask(self, frac, strat='smallest'):
         for i, layer_module in enumerate(self.layer):
@@ -711,8 +715,8 @@ class RobertaPreTrainedModel(PreTrainedModel):
     def add_mlp_masks(self):
         self.roberta.add_mlp_masks()
 
-    def clip_mask(self, frac, strat='smallest'):
-        self.roberta.clip_mask(frac, strat=strat)
+    def clip_mask(self, frac, strat='smallest', reversible=True):
+        self.roberta.clip_mask(frac, strat=strat, reversible=reversible)
 
     def prune_mask(self, frac, strat='smallest'):
         self.roberta.prune_mask(frac, strat=strat)
@@ -854,8 +858,8 @@ class RobertaModel(BertModelAdaptersMixin, RobertaPreTrainedModel):
     def add_mlp_masks(self):
         self.encoder.add_mlp_masks()
 
-    def clip_mask(self, frac, strat='smallest'):
-        self.encoder.clip_mask(frac, strat=strat)
+    def clip_mask(self, frac, strat='smallest', reversible=True):
+        self.encoder.clip_mask(frac, strat=strat, reversible=reversible)
 
     def prune_mask(self, frac, strat='smallest'):
         self.encoder.prune_mask(frac, strat=strat)
