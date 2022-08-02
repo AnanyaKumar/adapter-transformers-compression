@@ -462,7 +462,7 @@ class RobertaLayer(nn.Module):
                 self.mask_clipping = torch.ones(self.mask.num_features, dtype=torch.float32, device=device)
                 self.mask_clipping[clip_indices] = 0.0
             else:
-                self.mask.data[clip_indices] = 0.0
+                self.mask.mask.data[clip_indices] = 0.0
                 self.mask_clipping = None
 
     def prune_mask(self, frac, strat='smallest'):
